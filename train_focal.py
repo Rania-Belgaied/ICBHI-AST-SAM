@@ -8,6 +8,7 @@ from tqdm import tqdm
 import os
 import argparse
 import json
+import shutil
 from sklearn.metrics import confusion_matrix, recall_score, classification_report
 
 from src.dataset import ASTDataset
@@ -17,29 +18,17 @@ from src.sam import SAM
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOCAL LOSS
-# Pourquoi : CrossEntropyLoss traite tous les exemples de façon égale.
-# Le dataset ICBHI est très déséquilibré (Normal ~53%), donc le modèle apprend
-# à prédire "Normal" par défaut et ignore les classes rares.
-# Focal Loss ajoute un facteur (1 - pt)^gamma qui réduit la contribution des
-# exemples faciles (Normal bien prédit) et force le modèle à apprendre les
-# exemples difficiles (Crackle, Wheeze, Both).
-# gamma=0  → identique à CrossEntropy classique
-# gamma=2  → configuration recommandée pour données médicales déséquilibrées
 # ─────────────────────────────────────────────────────────────────────────────
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, weight=None):
         super().__init__()
         self.gamma  = gamma
-        self.weight = weight  # class weights pour pénaliser encore plus les classes rares
+        self.weight = weight
 
     def forward(self, inputs, targets):
-        # Cross-entropy par exemple (sans réduction pour pouvoir appliquer le facteur focal)
         ce = F.cross_entropy(inputs, targets,
                              weight=self.weight,
                              reduction='none')
-        # pt = probabilité assignée à la vraie classe
-        # Si le modèle est très confiant et a raison → pt proche de 1 → facteur proche de 0
-        # Si le modèle se trompe ou est incertain → pt proche de 0 → facteur proche de 1
         pt = torch.exp(-ce)
         focal = ((1 - pt) ** self.gamma) * ce
         return focal.mean()
@@ -67,9 +56,7 @@ def train(args):
     y_test  = data['y_test']
     d_test  = data['device_test']
 
-    # ── Afficher la distribution réelle des classes ───────────────────────────
-    # Pourquoi : confirmer le déséquilibre avant de calculer les poids
-    label_names = ['Normal', 'Crackle', 'Wheeze', 'Both']
+    label_names  = ['Normal', 'Crackle', 'Wheeze', 'Both']
     counts_train = np.bincount(y_train)
     print("\n📊 Distribution des classes (train) :")
     for i, name in enumerate(label_names):
@@ -78,11 +65,8 @@ def train(args):
     print(f"   {'Total':10s} : {len(y_train)}")
 
     # ── Class weights ─────────────────────────────────────────────────────────
-    # Pourquoi : donner plus de poids aux classes rares dans la loss.
-    # Poids = 1 / fréquence, puis normalisé pour sommer à 1.
-    # Résultat attendu : Both aura le poids le plus fort, Normal le plus faible.
-    class_weights = 1.0 / counts_train.astype(np.float32)
-    class_weights = class_weights / class_weights.sum()
+    class_weights        = 1.0 / counts_train.astype(np.float32)
+    class_weights        = class_weights / class_weights.sum()
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
 
     print("\n⚖️  Class weights calculés :")
@@ -94,11 +78,9 @@ def train(args):
         "MIT/ast-finetuned-audioset-10-10-0.4593"
     )
 
-    # ── Sampler (identique à train.py) ───────────────────────────────────────
-    # Pourquoi : le WeightedRandomSampler rééquilibre déjà les batches au niveau
-    # de l'échantillonnage. Combiné à la Focal Loss, l'effet est double.
+    # ── Sampler ───────────────────────────────────────────────────────────────
     sampler_weights = [1.0 / counts_train[y] for y in y_train]
-    sampler = WeightedRandomSampler(sampler_weights, len(y_train))
+    sampler         = WeightedRandomSampler(sampler_weights, len(y_train))
 
     # ── DataLoaders ───────────────────────────────────────────────────────────
     train_loader = DataLoader(
@@ -112,32 +94,45 @@ def train(args):
         shuffle=False
     )
 
-    # ── Modèle et optimiseur (identiques à train.py) ──────────────────────────
-    # Pourquoi garder SAM : on veut isoler l'effet de la Focal Loss.
-    # La seule variable qui change par rapport à train.py est le criterion.
+    # ── Modèle et optimiseur ──────────────────────────────────────────────────
     print("\n🧠 Preparing model...")
     model = CustomAST(num_classes=4).to(DEVICE)
 
     base_optimizer = torch.optim.AdamW
-    optimizer = SAM(
+    optimizer      = SAM(
         model.parameters(), base_optimizer,
         lr=args.lr, rho=0.05, weight_decay=1e-4
     )
-
-    # ── Criterion : Focal Loss + class weights ────────────────────────────────
-    # C'est la seule modification par rapport à train.py original :
-    # criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  ← original
-    # criterion = FocalLoss(gamma=2.0, weight=...)           ← notre version
     criterion = FocalLoss(gamma=args.gamma, weight=class_weights_tensor)
     print(f"🎯 Loss : FocalLoss(gamma={args.gamma}) + class weights ✓")
 
-    # ── Boucle d'entraînement ─────────────────────────────────────────────────
-    print("🚀 Train begins\n")
-    best_score        = 0.0
+    # ── Reprise depuis checkpoint si disponible ───────────────────────────────
+    resume_path       = os.path.join(args.checkpoint_dir, "resume_checkpoint.pth")
+    start_epoch       = 0
     best_recall_macro = 0.0
+    best_score        = 0.0
     history           = []
 
-    for epoch in range(args.epochs):
+    if os.path.exists(resume_path) and not args.restart:
+        print(f"\n🔄 Checkpoint trouvé — reprise depuis : {resume_path}")
+        ckpt = torch.load(resume_path, map_location=DEVICE)
+
+        model.load_state_dict(ckpt['model_state'])
+        optimizer.load_state_dict(ckpt['optimizer_state'])
+        start_epoch       = ckpt['epoch']
+        best_recall_macro = ckpt['best_recall_macro']
+        best_score        = ckpt['best_score']
+        history           = ckpt['history']
+
+        print(f"   ✅ Reprise à l'epoch {start_epoch + 1}/{args.epochs}")
+        print(f"   ✅ Meilleur recall macro jusqu'ici : {best_recall_macro:.4f}")
+    else:
+        print("\n🆕 Démarrage depuis l'epoch 1")
+
+    # ── Boucle d'entraînement ─────────────────────────────────────────────────
+    print("🚀 Train begins\n")
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         running_loss = 0.0
 
@@ -150,13 +145,11 @@ def train(args):
         for inputs, labels, _ in progress_bar:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
 
-            # SAM first step
             logits = model(inputs)
             loss   = criterion(logits, labels)
             loss.backward()
             optimizer.first_step(zero_grad=True)
 
-            # SAM second step
             criterion(model(inputs), labels).backward()
             optimizer.second_step(zero_grad=True)
 
@@ -176,24 +169,14 @@ def train(args):
                 all_labels.extend(labels.numpy())
 
         # ── Métriques ─────────────────────────────────────────────────────────
-        # Score original de l'article (Se + Sp) / 2 — gardé pour comparaison
-        cm = confusion_matrix(all_labels, all_preds)
-        se = (np.sum(cm[1:, 1:]) / np.sum(cm[1:, :])) if np.sum(cm[1:, :]) > 0 else 0
-        sp = (cm[0, 0] / np.sum(cm[0, :])) if np.sum(cm[0, :]) > 0 else 0
+        cm    = confusion_matrix(all_labels, all_preds)
+        se    = (np.sum(cm[1:, 1:]) / np.sum(cm[1:, :])) if np.sum(cm[1:, :]) > 0 else 0
+        sp    = (cm[0, 0] / np.sum(cm[0, :])) if np.sum(cm[0, :]) > 0 else 0
         score = (se + sp) / 2
 
-        # Recall macro — métrique cible du projet
-        recall_macro = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-
-        # Recall par classe
-        recall_per_class = recall_score(
-            all_labels, all_preds,
-            average=None,
-            zero_division=0,
-            labels=[0, 1, 2, 3]
-        )
-
-        avg_loss = running_loss / len(train_loader)
+        recall_macro     = recall_score(all_labels, all_preds, average='macro',  zero_division=0)
+        recall_per_class = recall_score(all_labels, all_preds, average=None,     zero_division=0, labels=[0, 1, 2, 3])
+        avg_loss         = running_loss / len(train_loader)
 
         print(f"Epoch {epoch+1:02d}/{args.epochs} | "
               f"Loss={avg_loss:.4f} | "
@@ -204,28 +187,40 @@ def train(args):
               f"Wheeze:{recall_per_class[2]:.3f} "
               f"Both:{recall_per_class[3]:.3f}")
 
-        # Historique pour sauvegarde finale
         history.append({
-            'epoch'        : epoch + 1,
-            'loss'         : round(avg_loss, 4),
-            'score'        : round(score, 4),
-            'se'           : round(se, 4),
-            'sp'           : round(sp, 4),
-            'recall_macro' : round(recall_macro, 4),
+            'epoch'         : epoch + 1,
+            'loss'          : round(avg_loss, 4),
+            'score'         : round(score, 4),
+            'se'            : round(se, 4),
+            'sp'            : round(sp, 4),
+            'recall_macro'  : round(recall_macro, 4),
             'recall_normal' : round(float(recall_per_class[0]), 4),
             'recall_crackle': round(float(recall_per_class[1]), 4),
             'recall_wheeze' : round(float(recall_per_class[2]), 4),
             'recall_both'   : round(float(recall_per_class[3]), 4),
         })
 
-        # Sauvegarde du meilleur modèle selon le recall macro
-        # Pourquoi recall_macro et non score : c'est la métrique cible du projet
+        # ── Sauvegarde meilleur modèle ────────────────────────────────────────
         if recall_macro > best_recall_macro:
             best_recall_macro = recall_macro
             best_score        = score
-            save_path = os.path.join(args.checkpoint_dir, "best_model_focal.pth")
-            torch.save(model.state_dict(), save_path)
+            best_path         = os.path.join(args.checkpoint_dir, "best_model_focal.pth")
+            torch.save(model.state_dict(), best_path)
             print(f"   --> 💾 Best recall macro saved : {best_recall_macro:.4f}")
+
+        # ── Resume checkpoint — écrasé à chaque epoch ─────────────────────────
+        torch.save({
+            'epoch'             : epoch + 1,
+            'model_state'       : model.state_dict(),
+            'optimizer_state'   : optimizer.state_dict(),
+            'best_recall_macro' : best_recall_macro,
+            'best_score'        : best_score,
+            'history'           : history,
+        }, resume_path)
+
+        # Copie immédiate dans /kaggle/working/ pour persistance inter-sessions
+        shutil.copy(resume_path, '/kaggle/working/resume_checkpoint.pth')
+        print(f"   --> 📌 Resume checkpoint sauvegardé (epoch {epoch+1}/{args.epochs})")
 
     # ── Résultats finaux ──────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -233,7 +228,6 @@ def train(args):
     print(f"🎯 Best Recall macro     : {best_recall_macro:.4f}  ← métrique cible")
     print(f"{'='*60}")
 
-    # Classification report complet sur la dernière epoch
     print("\n📋 Classification report (dernière epoch) :")
     print(classification_report(
         all_labels, all_preds,
@@ -242,8 +236,7 @@ def train(args):
         zero_division=0
     ))
 
-    # ── Sauvegarde JSON des résultats ─────────────────────────────────────────
-    # Pourquoi : Kaggle ferme les sessions — les résultats doivent être persistés
+    # ── Sauvegarde JSON finale ────────────────────────────────────────────────
     results = {
         'method'            : f'FocalLoss_gamma{args.gamma}_classweights',
         'hyperparameters'   : {
@@ -267,20 +260,28 @@ def train(args):
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
 
+    shutil.copy(results_path,
+                '/kaggle/working/results_focal.json')
+    shutil.copy(os.path.join(args.checkpoint_dir, 'best_model_focal.pth'),
+                '/kaggle/working/best_model_focal.pth')
+
     print(f"\n✅ Résultats sauvegardés : {results_path}")
+    print("📦 Fichiers copiés dans /kaggle/working/ ✓")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train AST + SAM avec Focal Loss pour améliorer le recall (ICBHI)"
     )
-    parser.add_argument("--data_path",       type=str,   default="./icbhi_ast_16k_8s_metadata.npz")
-    parser.add_argument("--checkpoint_dir",  type=str,   default="./checkpoints")
-    parser.add_argument("--epochs",          type=int,   default=20)
-    parser.add_argument("--batch_size",      type=int,   default=8)
-    parser.add_argument("--lr",              type=float, default=1e-5)
-    parser.add_argument("--gamma",           type=float, default=2.0,
+    parser.add_argument("--data_path",      type=str,   default="./icbhi_ast_16k_8s_metadata.npz")
+    parser.add_argument("--checkpoint_dir", type=str,   default="./checkpoints")
+    parser.add_argument("--epochs",         type=int,   default=20)
+    parser.add_argument("--batch_size",     type=int,   default=8)
+    parser.add_argument("--lr",             type=float, default=1e-5)
+    parser.add_argument("--gamma",          type=float, default=2.0,
                         help="Focal Loss gamma. 0=CrossEntropy, 2=recommandé")
+    parser.add_argument("--restart",        action="store_true",
+                        help="Ignorer le checkpoint et repartir de zéro")
 
     args = parser.parse_args()
     train(args)
