@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 from transformers import ASTFeatureExtractor
@@ -12,25 +11,8 @@ import shutil
 from sklearn.metrics import confusion_matrix, recall_score, classification_report
 
 from src.dataset import ASTDataset
-from src.model_cnn_ast import CustomAST_CNN   # ← seul changement d'import
+from src.model_cnn_ast import CustomAST_CNN   # ← seul changement vs train.py
 from src.sam import SAM
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, label_smoothing=0.1):
-        super().__init__()
-        self.gamma           = gamma
-        self.weight          = weight
-        self.label_smoothing = label_smoothing
-
-    def forward(self, inputs, targets):
-        ce = F.cross_entropy(inputs, targets,
-                             weight=self.weight,
-                             label_smoothing=self.label_smoothing,
-                             reduction='none')
-        pt = torch.exp(-ce)
-        focal = ((1 - pt) ** self.gamma) * ce
-        return focal.mean()
 
 
 def train(args):
@@ -53,62 +35,51 @@ def train(args):
     y_test  = data['y_test']
     d_test  = data['device_test']
 
-    label_names  = ['Normal', 'Crackle', 'Wheeze', 'Both']
-    counts_train = np.bincount(y_train)
-    print("\n📊 Distribution des classes (train) :")
-    for i, name in enumerate(label_names):
-        print(f"   {name:10s} : {counts_train[i]:4d} ({counts_train[i]/len(y_train)*100:.1f}%)")
-    print(f"   {'Total':10s} : {len(y_train)}")
+    # ── Processor + Sampler + DataLoaders (identiques à train.py) ─────────────
+    processor = ASTFeatureExtractor.from_pretrained(
+        "MIT/ast-finetuned-audioset-10-10-0.4593"
+    )
 
-    # ── Class weights ─────────────────────────────────────────────────────────
-    class_weights        = 1.0 / counts_train.astype(np.float32)
-    class_weights        = class_weights / class_weights.sum()
-    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
-
-    print("\n⚖️  Class weights :")
-    for i, name in enumerate(label_names):
-        print(f"   {name:10s} : {class_weights[i]:.4f}")
-
-    # ── Processor + DataLoaders ───────────────────────────────────────────────
-    processor       = ASTFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
-    sampler_weights = [1.0 / counts_train[y] for y in y_train]
-    sampler         = WeightedRandomSampler(sampler_weights, len(y_train))
+    counts  = np.bincount(y_train)
+    weights = [1.0 / counts[y] for y in y_train]
+    sampler = WeightedRandomSampler(weights, len(y_train))
 
     train_loader = DataLoader(
         ASTDataset(X_train, y_train, d_train, processor, train=True),
-        batch_size=args.batch_size, sampler=sampler
+        batch_size=args.batch_size,
+        sampler=sampler
     )
     test_loader = DataLoader(
         ASTDataset(X_test, y_test, d_test, processor, train=False),
-        batch_size=args.batch_size, shuffle=False
+        batch_size=args.batch_size,
+        shuffle=False
     )
 
     # ── Modèle CNN + AST ──────────────────────────────────────────────────────
-    # C'est le seul vrai changement par rapport à train_focal.py :
-    # CustomAST(num_classes=4)     → baseline
-    # CustomAST_CNN(num_classes=4) → notre version CNN + AST
-    print("\n🧠 Preparing CNN + AST model...")
+    # Seule différence avec train.py :
+    #   train.py       → CustomAST(num_classes=4)
+    #   train_cnn_ast  → CustomAST_CNN(num_classes=4)
+    # Tout le reste est identique à l'original.
+    print("🧠 Preparing CNN + AST model...")
     model = CustomAST_CNN(num_classes=4).to(DEVICE)
 
-    # Afficher le nombre de paramètres entraînables
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     print(f"   Paramètres entraînables : {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
 
+    # ── Optimiseur SAM + Loss (identiques à train.py) ─────────────────────────
     base_optimizer = torch.optim.AdamW
-    optimizer      = SAM(model.parameters(), base_optimizer,
-                         lr=args.lr, rho=0.05, weight_decay=1e-4)
-
-    criterion = FocalLoss(gamma=args.gamma,
-                          weight=class_weights_tensor,
-                          label_smoothing=args.label_smoothing)
-    print(f"🎯 Loss : FocalLoss(gamma={args.gamma}, ls={args.label_smoothing}) + class weights ✓")
+    optimizer      = SAM(
+        model.parameters(), base_optimizer,
+        lr=args.lr, rho=0.05, weight_decay=1e-4
+    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # identique à train.py
 
     # ── Resume checkpoint ─────────────────────────────────────────────────────
     resume_path       = os.path.join(args.checkpoint_dir, "resume_cnn_ast.pth")
     start_epoch       = 0
-    best_recall_macro = 0.0
     best_score        = 0.0
+    best_recall_macro = 0.0
     history           = []
 
     if os.path.exists(resume_path) and not args.restart:
@@ -117,32 +88,37 @@ def train(args):
         model.load_state_dict(ckpt['model_state'])
         optimizer.load_state_dict(ckpt['optimizer_state'])
         start_epoch       = ckpt['epoch']
-        best_recall_macro = ckpt['best_recall_macro']
         best_score        = ckpt['best_score']
+        best_recall_macro = ckpt['best_recall_macro']
         history           = ckpt['history']
         print(f"   ✅ Reprise epoch {start_epoch + 1}/{args.epochs}")
         print(f"   ✅ Meilleur recall macro : {best_recall_macro:.4f}")
     else:
         print("\n🆕 Démarrage depuis l'epoch 1")
 
-    # ── Boucle d'entraînement ─────────────────────────────────────────────────
+    # ── Boucle d'entraînement (identique à train.py) ──────────────────────────
     print("🚀 Train begins\n")
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
         running_loss = 0.0
 
-        progress_bar = tqdm(train_loader,
-                            desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        progress_bar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}/{args.epochs}",
+            leave=False
+        )
 
         for inputs, labels, _ in progress_bar:
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
 
+            # SAM first step
             logits = model(inputs)
             loss   = criterion(logits, labels)
             loss.backward()
             optimizer.first_step(zero_grad=True)
 
+            # SAM second step
             criterion(model(inputs), labels).backward()
             optimizer.second_step(zero_grad=True)
 
@@ -160,7 +136,7 @@ def train(args):
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.numpy())
 
-        # ── Métriques ─────────────────────────────────────────────────────────
+        # ── Métriques (score original + recall macro) ─────────────────────────
         cm    = confusion_matrix(all_labels, all_preds)
         se    = (np.sum(cm[1:, 1:]) / np.sum(cm[1:, :])) if np.sum(cm[1:, :]) > 0 else 0
         sp    = (cm[0, 0] / np.sum(cm[0, :])) if np.sum(cm[0, :]) > 0 else 0
@@ -192,7 +168,7 @@ def train(args):
             'recall_both'   : round(float(recall_per_class[3]), 4),
         })
 
-        # Meilleur modèle
+        # Sauvegarde meilleur modèle selon recall macro
         if recall_macro > best_recall_macro:
             best_recall_macro = recall_macro
             best_score        = score
@@ -200,13 +176,13 @@ def train(args):
                        os.path.join(args.checkpoint_dir, "best_model_cnn_ast.pth"))
             print(f"   --> 💾 Best recall macro saved : {best_recall_macro:.4f}")
 
-        # Resume checkpoint
+        # Resume checkpoint — écrasé à chaque epoch
         torch.save({
             'epoch'             : epoch + 1,
             'model_state'       : model.state_dict(),
             'optimizer_state'   : optimizer.state_dict(),
-            'best_recall_macro' : best_recall_macro,
             'best_score'        : best_score,
+            'best_recall_macro' : best_recall_macro,
             'history'           : history,
         }, resume_path)
 
@@ -220,20 +196,25 @@ def train(args):
     print(f"{'='*60}")
 
     print("\n📋 Classification report (dernière epoch) :")
+    label_names = ['Normal', 'Crackle', 'Wheeze', 'Both']
     print(classification_report(all_labels, all_preds,
-                                target_names=label_names, digits=4, zero_division=0))
+                                target_names=label_names,
+                                digits=4, zero_division=0))
 
+    # Sauvegarde JSON
     results = {
-        'method'            : f'CNN_AST_FocalLoss_gamma{args.gamma}_ls{args.label_smoothing}',
+        'method'            : 'CNN_AST_CrossEntropy_SAM',
         'hyperparameters'   : {
-            'epochs': args.epochs, 'batch_size': args.batch_size,
-            'lr': args.lr, 'gamma': args.gamma, 'label_smoothing': args.label_smoothing
+            'epochs'    : args.epochs,
+            'batch_size': args.batch_size,
+            'lr'        : args.lr,
         },
         'best_recall_macro' : best_recall_macro,
         'best_score'        : best_score,
         'history'           : history,
         'last_epoch_report' : classification_report(
-            all_labels, all_preds, target_names=label_names,
+            all_labels, all_preds,
+            target_names=label_names,
             output_dict=True, zero_division=0
         )
     }
@@ -242,7 +223,7 @@ def train(args):
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
 
-    shutil.copy(results_path,        '/kaggle/working/results_cnn_ast.json')
+    shutil.copy(results_path, '/kaggle/working/results_cnn_ast.json')
     shutil.copy(os.path.join(args.checkpoint_dir, 'best_model_cnn_ast.pth'),
                 '/kaggle/working/best_model_cnn_ast.pth')
 
@@ -251,14 +232,16 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CNN + AST avec Focal Loss pour ICBHI")
-    parser.add_argument("--data_path",       type=str,   default="./icbhi_ast_16k_8s_metadata.npz")
-    parser.add_argument("--checkpoint_dir",  type=str,   default="./checkpoints")
-    parser.add_argument("--epochs",          type=int,   default=15)
-    parser.add_argument("--batch_size",      type=int,   default=8)
-    parser.add_argument("--lr",              type=float, default=2e-5)
-    parser.add_argument("--gamma",           type=float, default=0.3)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
-    parser.add_argument("--restart",         action="store_true")
+    parser = argparse.ArgumentParser(
+        description="CNN + AST avec SAM pour ICBHI — même config que train.py"
+    )
+    parser.add_argument("--data_path",      type=str,   default="./icbhi_ast_16k_8s_metadata.npz")
+    parser.add_argument("--checkpoint_dir", type=str,   default="./checkpoints")
+    parser.add_argument("--epochs",         type=int,   default=20)
+    parser.add_argument("--batch_size",     type=int,   default=8)
+    parser.add_argument("--lr",             type=float, default=1e-5)
+    parser.add_argument("--restart",        action="store_true",
+                        help="Ignorer le checkpoint et repartir de zéro")
+
     args = parser.parse_args()
     train(args)
