@@ -137,12 +137,7 @@ class CustomAST_CNN(nn.Module):
         # ── Étape 4 : Transformer (couches self-attention de l'AST) ──────────
         # On passe directement nos tokens aux couches encoder de l'AST
         # en contournant le patch embedding original
-        encoder_output = self.ast.encoder(
-            hidden_states=tokens,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True
-        )
+        encoder_output = self.ast.encoder(hidden_states=tokens)
         hidden_states = encoder_output.last_hidden_state
         # (batch, nb_tokens, 768)
 
