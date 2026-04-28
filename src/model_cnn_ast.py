@@ -54,7 +54,7 @@ class CNNFeatureExtractor(nn.Module):
         x = x.unsqueeze(1)
 
         # Passage dans les 3 couches CNN
-        # Sortie : (batch, 128, freq/4, time/4)
+        # Sortie : (batch, 128, freq/8, time/8) après 3 MaxPool2d
         features = self.cnn(x)
 
         return features
@@ -62,6 +62,10 @@ class CNNFeatureExtractor(nn.Module):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CNN + AST HYBRIDE
+#
+# AMÉLIORATION vs version précédente :
+#   - unfreeze_last_n=6 au lieu de 4 → plus de couches AST entraînables
+#   - Dégel progressif géré depuis train_cnn_ast.py (epoch 15 = dégel total)
 #
 # Pipeline :
 #   1. CNNFeatureExtractor  → extrait les patterns locaux du spectrogramme
@@ -71,7 +75,7 @@ class CNNFeatureExtractor(nn.Module):
 #   5. Classifier           → prédit la classe (Normal/Crackle/Wheeze/Both)
 # ─────────────────────────────────────────────────────────────────────────────
 class CustomAST_CNN(nn.Module):
-    def __init__(self, num_classes=4):
+    def __init__(self, num_classes=4, unfreeze_last_n=6):
         super().__init__()
 
         # ── 1. CNN feature extractor ──────────────────────────────────────────
@@ -95,40 +99,52 @@ class CustomAST_CNN(nn.Module):
             "MIT/ast-finetuned-audioset-10-10-0.4593"
         )
 
-        # Geler les premières couches du Transformer (optionnel)
-        # Pourquoi : les premières couches de l'AST ont appris des
-        # représentations générales sur AudioSet — les garder gelées
-        # évite de les écraser avec le petit dataset ICBHI.
-        # On dégèle seulement les 4 dernières couches.
+        # ── Gel / Dégel des couches AST ───────────────────────────────────────
+        # AMÉLIORATION : unfreeze_last_n=6 au lieu de 4
+        #   Avant : 8 couches gelées sur 12 → seulement 4 couches entraînables
+        #   Après : 6 couches gelées sur 12 → 6 couches entraînables
+        #   + dégel total à l'epoch 15 (géré dans train_cnn_ast.py)
+        #
+        # Pourquoi garder les premières couches gelées au début :
+        #   - Elles ont appris des représentations audio générales sur AudioSet
+        #   - Les dégeler trop tôt sur le petit ICBHI = catastrophic forgetting
         total_layers = len(self.ast.encoder.layer)
         for i, layer in enumerate(self.ast.encoder.layer):
-            if i < total_layers - 4:   # geler les N-4 premières couches
+            if i < total_layers - unfreeze_last_n:
                 for param in layer.parameters():
                     param.requires_grad = False
 
+        # Geler aussi l'embedding original de l'AST (on ne l'utilise pas)
+        for param in self.ast.embeddings.parameters():
+            param.requires_grad = False
+
         # ── 4. Classifier ─────────────────────────────────────────────────────
+        # Dropout plus fort (0.4 vs 0.3) pour mieux régulariser sur ICBHI
         self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(768, num_classes)
+            nn.Dropout(0.4),
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
         # ── Étape 1 : extraction CNN ──────────────────────────────────────────
         # x : (batch, freq, time) — format sortie ASTFeatureExtractor
         cnn_features = self.cnn_extractor(x)
-        # cnn_features : (batch, 128, freq/4, time/4)
+        # cnn_features : (batch, 128, freq/8, time/8)
 
         batch_size = cnn_features.shape[0]
         C = cnn_features.shape[1]   # 128 canaux
 
         # ── Étape 2 : reshape en séquence de tokens ───────────────────────────
         # Le Transformer attend : (batch, nb_tokens, dim)
-        # On aplatit les dimensions spatiales (freq/4 × time/4) en tokens
+        # On aplatit les dimensions spatiales (freq/8 × time/8) en tokens
         cnn_features = cnn_features.permute(0, 2, 3, 1)
-        # (batch, freq/4, time/4, 128)
+        # (batch, freq/8, time/8, 128)
 
         cnn_features = cnn_features.reshape(batch_size, -1, C)
-        # (batch, nb_tokens, 128)   où nb_tokens = freq/4 × time/4
+        # (batch, nb_tokens, 128)   où nb_tokens = freq/8 × time/8
 
         # ── Étape 3 : projection 128 → 768 ───────────────────────────────────
         tokens = self.projection(cnn_features)
