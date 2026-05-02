@@ -149,19 +149,38 @@ def train(args):
     best_recall_macro = 0.0
     history           = []
 
+
     if os.path.exists(resume_path) and not args.restart:
         print(f"\n🔄 Reprise depuis : {resume_path}")
         ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-        model.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer_state'])
+        
+        # Chargement partiel : uniquement les clés compatibles
+        model_state   = model.state_dict()
+        ckpt_state    = ckpt['model_state']
+        matched, skipped = 0, 0
+        
+        for k, v in ckpt_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                model_state[k] = v
+                matched += 1
+            else:
+                skipped += 1
+        
+        model.load_state_dict(model_state)
+        
+        # Reprendre optimizer/scheduler seulement si c'est un vrai checkpoint
+        if 'optimizer_state' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state'])
         if 'scheduler_state' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state'])
-        start_epoch       = ckpt['epoch']
-        best_score        = ckpt['best_score']
-        best_recall_macro = ckpt['best_recall_macro']
-        history           = ckpt['history']
+        
+        start_epoch       = ckpt.get('epoch', 0)
+        best_score        = ckpt.get('best_score', 0.0)
+        best_recall_macro = ckpt.get('best_recall_macro', 0.0)
+        history           = ckpt.get('history', [])
+        
+        print(f"   ✅ Poids chargés : {matched} couches compatibles, {skipped} ignorées")
         print(f"   ✅ Reprise epoch {start_epoch + 1}/{args.epochs}")
-        print(f"   ✅ Meilleur recall macro : {best_recall_macro:.4f}")
     else:
         print("\n🆕 Démarrage depuis l'epoch 1")
 
